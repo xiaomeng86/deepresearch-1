@@ -5,6 +5,7 @@
 行业资讯和招投标信息路由
 """
 import logging
+import os
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from sqlalchemy.orm import Session
 from typing import Optional, List
@@ -145,11 +146,26 @@ async def trigger_collection(
         if bidding_result.get("errors"):
             errors.extend(bidding_result["errors"])
 
+        news_collected = news_result.get("collected", 0)
+        bidding_collected = bidding_result.get("collected", 0)
+        total = news_collected + bidding_collected
+        providers = result.get("providers") or []
+
+        # message 必须反映真实结果，不能在 0 条时也报"采集完成"
+        if total > 0:
+            message = f"采集完成：新增资讯 {news_collected} 条、招投标 {bidding_collected} 条"
+            if providers:
+                message += f"（数据源: {', '.join(providers)}）"
+        elif errors:
+            message = f"采集未获得新数据：{errors[0]}"
+        else:
+            message = "采集完成：没有新增数据（可能已全部入库）"
+
         response = CollectionResponse(
-            success=result.get("success", False),
-            message="采集完成",
-            news_collected=news_result.get("collected", 0),
-            bidding_collected=bidding_result.get("collected", 0),
+            success=bool(total > 0) or result.get("success", False),
+            message=message,
+            news_collected=news_collected,
+            bidding_collected=bidding_collected,
             errors=errors[:10]  # 只返回前10个错误
         )
         logger.info(f"[news_router] trigger_collection 返回: success={response.success}, news={response.news_collected}, bidding={response.bidding_collected}")
@@ -193,6 +209,21 @@ async def check_data_status(db: Session = Depends(get_db)):
         "news_count": news_stats["total"],
         "bidding_count": bidding_stats["total"],
         "news_recent_24h": news_stats.get("recent_24h", 0)
+    }
+
+
+@router.get("/sources/status")
+async def get_source_status():
+    """
+    搜索源诊断：查看各数据源是否配置可用（排障用）
+    """
+    from service.news_source_service import NewsSearchService, is_placeholder
+
+    service = NewsSearchService()
+    return {
+        "success": True,
+        "providers": service.provider_status(),
+        "bidding_api_configured": not is_placeholder(os.getenv("BID_APP_CODE")),
     }
 
 

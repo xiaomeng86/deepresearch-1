@@ -2,6 +2,7 @@
 # 未经授权，禁止转售或仿制。
 
 """聊天附件路由"""
+import logging
 import os
 import shutil
 from typing import List, Optional
@@ -15,10 +16,12 @@ from models.user import User
 from router.auth_router import get_current_user
 from schemas.chat import AttachmentResponse, AttachmentListResponse
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/attachments", tags=["聊天附件"])
 
 # 文件上传目录
-UPLOAD_DIR = "/tmp/chat_attachments"
+UPLOAD_DIR = os.getenv("ATTACHMENT_UPLOAD_DIR", "/tmp/chat_attachments")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # 支持的文件类型
@@ -38,73 +41,83 @@ def get_file_extension(filename: str) -> str:
 
 
 def attachment_to_response(att: ChatAttachment) -> AttachmentResponse:
-    """将附件模型转换为响应"""
+    """将附件模型转换为响应（status 是接口级状态，业务状态用 process_status）"""
     return AttachmentResponse(
+        status="success",
         id=str(att.id),
         session_id=str(att.session_id),
         message_id=str(att.message_id) if att.message_id else None,
         filename=att.filename,
         file_type=att.file_type,
         file_size=att.file_size,
-        status=att.status,
+        process_status=att.status,
         error_message=att.error_message,
+        content_length=len(att.content_text or ""),
         created_at=att.created_at,
     )
 
 
 async def process_attachment(attachment_id: str, file_path: str, db_session_factory):
-    """后台处理附件（提取文本内容）"""
-    import logging
-    logger = logging.getLogger("AttachmentProcessor")
+    """
+    后台处理附件（提取文本内容）
 
+    修复点（问题2的第二部分）：
+    旧实现只对纯文本类做真实读取，PDF/Word/图片一律写入 "[PDF 文件: xxx]" 占位符，
+    导致带附件提问时模型拿不到任何内容，"聊天引用文件回答" 无法闭环。
+    现在统一走 document_parser_service（本地解析优先，必要时 DocMind OCR）。
+    """
     db = db_session_factory()
+    att = None
     try:
         att = db.query(ChatAttachment).filter(ChatAttachment.id == attachment_id).first()
         if not att:
+            logger.error("[process_attachment] 附件记录不存在: %s", attachment_id)
             return
 
         att.status = "processing"
+        att.error_message = None
         db.commit()
 
+        from service.document_parser_service import DocumentParseError, parse_document
+
         try:
-            content_text = ""
-            ext = get_file_extension(att.filename)
+            parsed = parse_document(file_path, att.filename)
+            content_text = parsed.text or ""
 
-            # 简单的文本提取（可以扩展为使用 DocMind）
-            if ext in {'.txt', '.md', '.py', '.js', '.ts', '.json', '.yaml', '.yml', '.xml', '.csv', '.html'}:
-                # 直接读取文本文件
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content_text = f.read()
-            elif ext == '.pdf':
-                # PDF 需要特殊处理，这里暂时跳过
-                # 可以后续集成 DocMind 或 PyPDF2
-                content_text = f"[PDF 文件: {att.filename}]"
-            elif ext in {'.docx', '.doc'}:
-                # Word 文档需要特殊处理
-                content_text = f"[Word 文档: {att.filename}]"
-            elif ext in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}:
-                # 图片文件
-                content_text = f"[图片: {att.filename}]"
+            if not content_text.strip():
+                att.status = "failed"
+                att.error_message = f"未能从文件中提取到文本（解析器: {parsed.parser}）"
+                logger.warning("[process_attachment] %s: %s", attachment_id, att.error_message)
             else:
-                content_text = f"[文件: {att.filename}]"
+                # 限制内容长度
+                if len(content_text) > 50000:
+                    content_text = content_text[:50000] + "\n...[内容已截断]"
+                att.content_text = content_text
+                att.status = "completed"
+                att.error_message = None
+                logger.info(
+                    "[process_attachment] 附件解析成功 %s: parser=%s, chars=%s",
+                    attachment_id, parsed.parser, len(content_text),
+                )
 
-            # 限制内容长度
-            if len(content_text) > 50000:
-                content_text = content_text[:50000] + "\n...[内容已截断]"
-
-            att.content_text = content_text
-            att.status = "completed"
-            att.error_message = None
-
-        except Exception as e:
-            logger.error(f"处理附件失败: {e}")
+        except DocumentParseError as e:
+            logger.error("[process_attachment] 解析失败 %s: %s", attachment_id, e)
             att.status = "failed"
             att.error_message = str(e)
 
         db.commit()
 
     except Exception as e:
-        logger.error(f"附件处理异常: {e}")
+        logger.exception("[process_attachment] 附件处理异常 %s: %s", attachment_id, e)
+        try:
+            if att is None:
+                att = db.query(ChatAttachment).filter(ChatAttachment.id == attachment_id).first()
+            if att:
+                att.status = "failed"
+                att.error_message = f"{type(e).__name__}: {e}"
+                db.commit()
+        except Exception:
+            logger.exception("[process_attachment] 写入失败状态时再次异常 %s", attachment_id)
     finally:
         db.close()
 

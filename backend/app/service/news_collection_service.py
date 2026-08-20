@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from models.news import IndustryNews, BiddingInfo, NewsCollectionTask
 from service.bidding_service import get_bidding_service
+from service.news_source_service import NewsSearchService, is_placeholder
 from config.industry_config import get_industry_config, get_all_industries
 
 logger = logging.getLogger(__name__)
@@ -30,74 +31,36 @@ class NewsCollectionService:
         self.db = db
         self.bocha_api_key = os.getenv("BOCHA_API_KEY", "")
         self.bidding_service = get_bidding_service()
+        # 每次采集使用独立的搜索服务实例，保证"本轮禁用"状态不跨请求污染
+        self.search_service = NewsSearchService()
 
-        if not self.bocha_api_key:
-            logger.warning("BOCHA_API_KEY 环境变量未设置")
+        if is_placeholder(self.bocha_api_key):
+            logger.warning("BOCHA_API_KEY 未配置或为占位符，将使用回退搜索源")
 
-    async def _bocha_search(self, query: str, count: int = 10) -> List[Dict]:
+    async def _search(self, query: str, count: int = 10) -> tuple[List[Dict], Optional[str], str]:
         """
-        使用 Bocha API 进行搜索
-
-        Args:
-            query: 搜索关键词
-            count: 返回数量
+        执行搜索（带多源回退）
 
         Returns:
-            搜索结果列表
+            (results, error, provider)
+            error 为真实失败原因（例如 "bocha: HTTP 403: You do not have enough money or package quota"）
         """
-        logger.info(f"[_bocha_search] 搜索: query='{query}', count={count}")
+        logger.info(f"[_search] 搜索: query='{query}', count={count}")
+        outcome = await self.search_service.search(query, count=count)
 
-        if not self.bocha_api_key:
-            logger.error("[_bocha_search] Bocha API key not configured")
-            return []
+        if outcome.results:
+            logger.info(
+                f"[_search] provider={outcome.provider} 返回 {len(outcome.results)} 条结果"
+            )
+            return outcome.results, None, outcome.provider
 
-        url = "https://api.bochaai.com/v1/web-search"
-        payload = {
-            "query": query,
-            "summary": True,
-            "count": count,
-            "page": 1
-        }
-        headers = {
-            'Authorization': f"Bearer {self.bocha_api_key}",
-            'Content-Type': 'application/json'
-        }
+        logger.warning(f"[_search] 搜索 '{query}' 失败: {outcome.error}")
+        return [], outcome.error, outcome.provider
 
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                logger.info(f"[_bocha_search] 发送请求到 {url}")
-                response = await client.post(url, headers=headers, json=payload)
-                logger.info(f"[_bocha_search] 响应状态码: {response.status_code}")
-                response.raise_for_status()
-                data = response.json()
-                logger.info(f"[_bocha_search] 响应数据键: {data.keys() if isinstance(data, dict) else type(data)}")
-
-                webpages_data = data.get('data', {}).get('webPages', {})
-                value_list = webpages_data.get('value', [])
-                logger.info(f"[_bocha_search] 获取到 {len(value_list) if isinstance(value_list, list) else 0} 条结果")
-
-                if not isinstance(value_list, list):
-                    logger.warning(f"[_bocha_search] value_list 不是列表: {type(value_list)}")
-                    return []
-
-                results = []
-                for item in value_list:
-                    if item.get('url') and (item.get('snippet') or item.get('summary')):
-                        results.append({
-                            'url': item.get('url', ''),
-                            'title': item.get('name', ''),
-                            'summary': item.get('summary', '') or item.get('snippet', ''),
-                            'snippet': item.get('snippet', ''),
-                            'siteName': item.get('siteName', ''),
-                            'datePublished': item.get('datePublished', ''),
-                        })
-
-                logger.info(f"[_bocha_search] 返回 {len(results)} 条有效结果")
-                return results
-
-        except Exception as e:
-            logger.error(f"[_bocha_search] Bocha search error for '{query}': {e}", exc_info=True)
-            return []
+    async def _bocha_search(self, query: str, count: int = 10) -> List[Dict]:
+        """兼容旧调用方的入口（内部已改为多源回退）"""
+        results, _, _ = await self._search(query, count)
+        return results
 
     async def collect_news(self, max_items: int = 20, industry_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -125,6 +88,7 @@ class NewsCollectionService:
 
         collected = []
         errors = []
+        providers_used = set()
 
         try:
             items_per_keyword = max(2, max_items // len(news_keywords))
@@ -134,12 +98,21 @@ class NewsCollectionService:
                     break
 
                 try:
-                    # 使用Bocha搜索
-                    results = await self._bocha_search(keyword, count=items_per_keyword + 2)
+                    # 多源搜索（Bocha -> Serper -> 免费源）
+                    results, search_error, provider = await self._search(
+                        keyword, count=items_per_keyword + 2
+                    )
 
                     if not results:
-                        errors.append(f"搜索 '{keyword}' 无结果")
+                        errors.append(
+                            f"搜索 '{keyword}' 失败: {search_error or '所有搜索源均无结果'}"
+                        )
                         continue
+
+                    providers_used.add(provider)
+                    if search_error:
+                        # 回退成功但主源有问题：记录真实原因，便于运维处理配额
+                        logger.warning("搜索 '%s' 已回退 %s；前序失败: %s", keyword, provider, search_error)
 
                     count = 0
                     for item in results:
@@ -196,7 +169,10 @@ class NewsCollectionService:
 
             self.db.commit()
 
-            task.status = "completed"
+            # success 反映真实结果：一条都没落库且全部关键词报错时不算成功
+            success = len(collected) > 0 or not errors
+
+            task.status = "completed" if success else "failed"
             task.total_collected = len(collected)
             task.completed_at = datetime.utcnow()
             if errors:
@@ -204,9 +180,10 @@ class NewsCollectionService:
             self.db.commit()
 
             return {
-                "success": True,
+                "success": success,
                 "collected": len(collected),
-                "errors": errors
+                "errors": errors,
+                "providers": sorted(providers_used),
             }
 
         except Exception as e:
@@ -214,12 +191,13 @@ class NewsCollectionService:
             task.error_message = str(e)
             task.completed_at = datetime.utcnow()
             self.db.commit()
-            logger.error(f"News collection failed: {e}")
+            logger.error(f"News collection failed: {e}", exc_info=True)
 
             return {
                 "success": False,
                 "error": str(e),
-                "collected": len(collected)
+                "collected": len(collected),
+                "errors": errors + [str(e)],
             }
 
     async def collect_bidding(self, max_items: int = 20, industry_id: Optional[str] = None) -> Dict[str, Any]:
@@ -409,31 +387,36 @@ class NewsCollectionService:
         """
         industry_config = get_industry_config(industry_id)
         logger.info(f"[NewsCollectionService] collect_all 开始: industry={industry_config.name}, max_news={max_news}, max_bidding={max_bidding}")
-        logger.info(f"[NewsCollectionService] BOCHA_API_KEY 已配置: {bool(self.bocha_api_key)}")
+        logger.info(f"[NewsCollectionService] 搜索源状态: {self.search_service.provider_status()}")
 
         news_result = await self.collect_news(max_news, industry_id)
         logger.info(f"[NewsCollectionService] collect_news 结果: {news_result}")
 
-        # 检查招投标 API 是否可用
-        if not self.bidding_service.app_code:
-            logger.warning("[NewsCollectionService] 招投标 API 未配置，跳过招投标采集")
+        # 检查招投标 API 是否真的可用（占位符 your-bid-app-code 会被 81API 拒为 401）
+        if is_placeholder(self.bidding_service.app_code):
+            logger.warning("[NewsCollectionService] 招投标 API 未配置有效 BID_APP_CODE，跳过招投标采集")
             bidding_result = {
                 "success": True,
                 "collected": 0,
-                "errors": [],
+                "errors": ["招投标采集已跳过：BID_APP_CODE 未配置有效值（当前为空或占位符）"],
                 "skipped": "BID_APP_CODE 未配置"
             }
         else:
             bidding_result = await self.collect_bidding(max_bidding, industry_id)
             logger.info(f"[NewsCollectionService] collect_bidding 结果: {bidding_result}")
 
+        news_ok = news_result.get("success", False)
+        bidding_ok = bidding_result.get("success", False)
+
         result = {
-            "success": news_result.get("success") or bidding_result.get("success"),
+            "success": news_ok or bidding_ok,
             "news": news_result,
             "bidding": bidding_result,
-            "industry": industry_config.name
+            "industry": industry_config.name,
+            "providers": news_result.get("providers", []),
         }
-        logger.info(f"[NewsCollectionService] collect_all 返回: {result}")
+        logger.info(f"[NewsCollectionService] collect_all 返回: success={result['success']}, "
+                    f"news={news_result.get('collected')}, bidding={bidding_result.get('collected')}")
         return result
 
     def get_news_list(

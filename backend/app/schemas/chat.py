@@ -97,15 +97,29 @@ class ChatResponse(BaseModel):
 # ========== 聊天附件相关 Schema ==========
 
 class AttachmentResponse(BaseModel):
-    """附件响应"""
+    """
+    附件响应
+
+    注意（问题2的根因修复）：
+    前端 axios 拦截器（frontend/src/api/request/plugins/service.ts）把响应体顶层的
+    `status` 字段当作「接口级状态码」，只有 'success' 才算成功。
+    旧实现把业务处理状态（pending/processing/completed/failed）直接放在 `status`，
+    于是上传成功（HTTP 201）也会被前端判定为失败；又因为响应体里没有 message/detail，
+    前端最终提示 'API data exception'。
+
+    现在：`status` 固定为接口级状态 'success'，业务状态改用 `process_status`。
+    """
+    status: str = Field(default="success", description="接口级状态，固定为 success")
     id: str = Field(..., description="附件ID")
     session_id: str = Field(..., description="会话ID")
     message_id: Optional[str] = Field(None, description="消息ID")
     filename: str = Field(..., description="文件名")
     file_type: str = Field(..., description="文件类型")
     file_size: int = Field(..., description="文件大小（字节）")
-    status: str = Field(..., description="处理状态: pending, processing, completed, failed")
+    process_status: str = Field(..., description="处理状态: pending, processing, completed, failed")
     error_message: Optional[str] = Field(None, description="错误信息")
+    content_length: int = Field(0, description="已提取的文本长度")
+    parser: Optional[str] = Field(None, description="实际使用的解析器")
     created_at: datetime = Field(..., description="创建时间")
 
     class Config:
@@ -114,6 +128,7 @@ class AttachmentResponse(BaseModel):
 
 class AttachmentListResponse(BaseModel):
     """附件列表响应"""
+    status: str = Field(default="success", description="接口级状态，固定为 success")
     attachments: List[AttachmentResponse] = Field(default_factory=list, description="附件列表")
     total: int = Field(0, description="总数")
 

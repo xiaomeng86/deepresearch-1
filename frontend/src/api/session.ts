@@ -154,8 +154,13 @@ export interface Attachment {
   filename: string
   file_type: string
   file_size: number
-  status: 'pending' | 'processing' | 'completed' | 'failed'
+  /** 接口级状态，固定为 success */
+  status?: 'success'
+  /** 业务处理状态（后端字段已由 status 改名为 process_status，避免与接口级状态冲突） */
+  process_status: 'pending' | 'processing' | 'completed' | 'failed'
   error_message?: string
+  content_length?: number
+  parser?: string
   created_at: string
 }
 

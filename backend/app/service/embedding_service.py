@@ -9,6 +9,7 @@ Embedding 服务 - 使用阿里 DashScope
 2. rerank_similarity - 使用 DashScope Rerank 重排序
 """
 
+import logging
 import os
 from typing import List, Optional, Tuple
 import numpy as np
@@ -19,6 +20,12 @@ from llama_index.postprocessor.dashscope_rerank import DashScopeRerank
 
 from dotenv import load_dotenv
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+
+class EmbeddingError(Exception):
+    """Embedding 生成失败（携带底层 API 的真实错误信息）"""
 
 
 def generate_embedding(
@@ -95,6 +102,84 @@ def generate_embedding(
         return all_embeddings
 
     return None
+
+
+def generate_embeddings(
+    texts: List[str],
+    api_key: str = None,
+    base_url: str = None,
+    model_name: str = "text-embedding-v4",
+    dimensions: int = 1024,
+    encoding_format: str = "float",
+    max_batch_size: int = 10,
+) -> List[List[float]]:
+    """
+    批量生成向量（严格模式）
+
+    与 generate_embedding 的区别：任何一批失败都会抛出 EmbeddingError，
+    并附带底层 API 的真实错误信息，而不是静默塞入 None 让上层在
+    `len(embeddings[0])` 处炸成 "object of type 'NoneType' has no len()"。
+
+    Args:
+        texts: 文本列表
+
+    Returns:
+        与 texts 等长的向量列表
+
+    Raises:
+        EmbeddingError: 缺少配置、客户端初始化失败或 API 调用失败
+    """
+    if not texts:
+        return []
+
+    api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
+    base_url = base_url or os.getenv(
+        "DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+    model_name = os.getenv("EMBEDDING_MODEL", model_name)
+
+    if not api_key:
+        raise EmbeddingError("缺少 DASHSCOPE_API_KEY 环境变量")
+
+    try:
+        client = OpenAI(api_key=api_key, base_url=base_url)
+    except Exception as e:
+        raise EmbeddingError(f"初始化 Embedding 客户端失败: {type(e).__name__}: {e}") from e
+
+    all_embeddings: List[List[float]] = []
+    total_batches = (len(texts) + max_batch_size - 1) // max_batch_size
+
+    for i in range(0, len(texts), max_batch_size):
+        batch = texts[i:i + max_batch_size]
+        batch_no = i // max_batch_size + 1
+        try:
+            completion = client.embeddings.create(
+                model=model_name,
+                input=batch,
+                dimensions=dimensions,
+                encoding_format=encoding_format,
+            )
+        except Exception as e:
+            raise EmbeddingError(
+                f"Embedding 请求失败 (batch {batch_no}/{total_batches}, model={model_name}, "
+                f"base_url={base_url}): {type(e).__name__}: {e}"
+            ) from e
+
+        batch_embeddings = [item.embedding for item in completion.data]
+        if len(batch_embeddings) != len(batch):
+            raise EmbeddingError(
+                f"Embedding 数量不匹配 (batch {batch_no}): 期望 {len(batch)} 个，"
+                f"实际 {len(batch_embeddings)} 个"
+            )
+        all_embeddings.extend(batch_embeddings)
+
+    if len(all_embeddings) != len(texts):
+        raise EmbeddingError(
+            f"Embedding 数量不匹配: 期望 {len(texts)} 个，实际 {len(all_embeddings)} 个"
+        )
+
+    logger.info("生成 %s 个向量，维度 %s", len(all_embeddings), len(all_embeddings[0]))
+    return all_embeddings
 
 
 def rerank_similarity(

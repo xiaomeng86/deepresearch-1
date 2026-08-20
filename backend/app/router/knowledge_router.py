@@ -2,6 +2,7 @@
 # 未经授权，禁止转售或仿制。
 
 """知识库管理路由"""
+import logging
 import os
 import shutil
 from typing import List
@@ -22,10 +23,12 @@ from schemas.knowledge import (
     DocumentUploadResponse,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/knowledge-bases", tags=["知识库管理"])
 
-# 文件上传目录
-UPLOAD_DIR = "/tmp/knowledge_uploads"
+# 文件上传目录（可通过环境变量覆盖；重启不丢失才能支持失败重试）
+UPLOAD_DIR = os.getenv("KNOWLEDGE_UPLOAD_DIR", "/tmp/knowledge_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # 支持的文件类型
@@ -72,52 +75,69 @@ def doc_to_response(doc: Document) -> DocumentResponse:
     )
 
 
-async def process_document(document_id: str, file_path: str, kb_name: str, db_session_factory):
-    """后台处理文档（使用 DocMind 解析、向量化、存储到ES）"""
-    from service.docmind_service import process_document_with_docmind
+async def process_document(document_id: str, file_path: str, kb_id: str, kb_name: str, db_session_factory):
+    """
+    后台处理文档：解析 -> 切分 -> 向量化 -> 写入 Milvus
 
-    # 创建新的数据库会话
+    修复点：
+    1. 所有 import 与逻辑都在 try 内，import 失败也会把文档标记为 failed（旧代码会让任务静默崩溃、
+       文档永远停留在 pending）
+    2. 集合名由知识库 UUID 生成，避免中文知识库名导致 Milvus "Invalid collection name"
+    3. 失败时写入真实异常类型与信息，并打印完整堆栈到后端日志
+    4. 不再删除源文件，便于失败后重试（reprocess 接口）
+    """
     db = db_session_factory()
+    doc = None
     try:
-        # 获取文档记录
         doc = db.query(Document).filter(Document.id == document_id).first()
         if not doc:
+            logger.error("[process_document] 文档记录不存在: %s", document_id)
             return
 
-        # 更新状态为处理中
         doc.status = "processing"
+        doc.error_message = None
         db.commit()
 
-        try:
-            # 使用知识库名称作为ES索引名
-            index_name = f"kb_{kb_name}".lower().replace(" ", "_")
+        from service.collection_naming import kb_collection_name
+        from service.docmind_service import process_document_with_docmind
 
-            # 使用 DocMind 处理文档
-            result = process_document_with_docmind(
-                file_path=file_path,
-                file_name=doc.filename,
-                index_name=index_name,
-            )
+        collection_name = kb_collection_name(kb_id, kb_name)
+        logger.info(
+            "[process_document] 开始处理 doc=%s file=%s kb=%s collection=%s",
+            document_id, doc.filename, kb_name, collection_name,
+        )
 
-            if result["success"]:
-                doc.status = "completed"
-                doc.chunk_count = result["document_count"]
-                doc.error_message = None
-            else:
-                doc.status = "failed"
-                doc.error_message = result["message"]
+        result = process_document_with_docmind(
+            file_path=file_path,
+            file_name=doc.filename,
+            index_name=collection_name,
+        )
 
-        except Exception as e:
+        if result.get("success"):
+            doc.status = "completed"
+            doc.chunk_count = result.get("document_count", 0)
+            doc.error_message = None
+            logger.info("[process_document] 处理成功 doc=%s %s", document_id, result.get("message"))
+        else:
             doc.status = "failed"
-            doc.error_message = str(e)
+            doc.error_message = result.get("message") or "未知错误"
+            logger.error("[process_document] 处理失败 doc=%s: %s", document_id, doc.error_message)
 
         db.commit()
 
+    except Exception as e:
+        logger.exception("[process_document] 处理异常 doc=%s: %s", document_id, e)
+        try:
+            if doc is None:
+                doc = db.query(Document).filter(Document.id == document_id).first()
+            if doc:
+                doc.status = "failed"
+                doc.error_message = f"{type(e).__name__}: {e}"
+                db.commit()
+        except Exception:
+            logger.exception("[process_document] 写入失败状态时再次异常 doc=%s", document_id)
     finally:
         db.close()
-        # 清理临时文件
-        if os.path.exists(file_path):
-            os.remove(file_path)
 
 
 @router.get("", response_model=List[KnowledgeBaseResponse])
@@ -281,6 +301,17 @@ async def delete_knowledge_base(
             detail="知识库不存在"
         )
 
+    # 删除对应的 Milvus 集合（忽略失败，不阻断数据库删除）
+    try:
+        from service.collection_naming import candidate_collection_names
+        from service.milvus_service import get_milvus_service
+
+        milvus = get_milvus_service()
+        for collection_name in candidate_collection_names(kb.id, kb.name):
+            milvus.delete_collection(collection_name)
+    except Exception as e:
+        logger.warning("[delete_knowledge_base] 删除集合失败（忽略）: %s", e)
+
     db.delete(kb)
     db.commit()
     return None
@@ -363,6 +394,7 @@ async def upload_document(
         process_document,
         str(doc.id),
         file_path,
+        str(kb_uuid),
         kb.name,
         SessionLocal
     )
@@ -372,6 +404,68 @@ async def upload_document(
         filename=doc.filename,
         process_status="pending",
         message="文档已上传，正在后台处理中"
+    )
+
+
+@router.post("/{kb_id}/documents/{doc_id}/reprocess", response_model=DocumentUploadResponse)
+async def reprocess_document(
+    kb_id: str,
+    doc_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user_required),
+    db: Session = Depends(get_db),
+):
+    """重新处理文档（用于修复失败文档，无需重新上传）"""
+    try:
+        kb_uuid = UUID(kb_id)
+        doc_uuid = UUID(doc_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="无效的ID格式"
+        )
+
+    kb = db.query(KnowledgeBase).filter(
+        KnowledgeBase.id == kb_uuid,
+        KnowledgeBase.user_id == current_user.id
+    ).first()
+    if not kb:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="知识库不存在")
+
+    doc = db.query(Document).filter(
+        Document.id == doc_uuid,
+        Document.knowledge_base_id == kb_uuid
+    ).first()
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
+
+    if not doc.file_path or not os.path.exists(doc.file_path):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="源文件已不存在，请重新上传该文档"
+        )
+
+    doc.status = "pending"
+    doc.error_message = None
+    db.commit()
+    db.refresh(doc)
+
+    from core.database import SessionLocal
+
+    background_tasks.add_task(
+        process_document,
+        str(doc.id),
+        doc.file_path,
+        str(kb_uuid),
+        kb.name,
+        SessionLocal
+    )
+
+    return DocumentUploadResponse(
+        id=str(doc.id),
+        filename=doc.filename,
+        process_status="pending",
+        message="文档已重新提交处理"
     )
 
 
@@ -458,16 +552,22 @@ async def get_document_chunks(
             detail="文档尚未处理完成"
         )
 
-    # 从 Milvus 获取切片
-    collection_name = f"kb_{kb.name}".lower().replace(" ", "_")
-    print(f"[get_document_chunks] 查询切片: collection={collection_name}, filename={doc.filename}")
+    # 从 Milvus 获取切片（兼容新旧集合命名）
+    from service.collection_naming import candidate_collection_names
 
+    chunks = []
+    tried = []
     try:
         milvus = get_milvus_service()
-        chunks = milvus.get_chunks_by_filename(collection_name, doc.filename)
-        print(f"[get_document_chunks] 找到 {len(chunks)} 个切片")
+        for collection_name in candidate_collection_names(kb.id, kb.name):
+            tried.append(collection_name)
+            found = milvus.get_chunks_by_filename(collection_name, doc.filename)
+            if found:
+                chunks = found
+                break
+        logger.info("[get_document_chunks] collections=%s, 命中 %s 个切片", tried, len(chunks))
     except Exception as e:
-        print(f"[get_document_chunks] Milvus 查询失败: {e}")
+        logger.error("[get_document_chunks] Milvus 查询失败 (collections=%s): %s", tried, e)
         # 返回空结果而不是报错
         chunks = []
 
@@ -529,6 +629,20 @@ async def delete_document(
     # 删除文件（如果存在）
     if doc.file_path and os.path.exists(doc.file_path):
         os.remove(doc.file_path)
+
+    # 同步删除 Milvus 中的切片，避免检索到已删除文档
+    try:
+        import hashlib
+
+        from service.collection_naming import candidate_collection_names
+        from service.milvus_service import get_milvus_service
+
+        milvus = get_milvus_service()
+        doc_hash = hashlib.md5(doc.filename.encode()).hexdigest()
+        for collection_name in candidate_collection_names(kb.id, kb.name):
+            milvus.delete_by_doc_id(collection_name, doc_hash)
+    except Exception as e:
+        logger.warning("[delete_document] 删除向量失败（忽略）: %s", e)
 
     # 更新知识库文档计数
     kb.document_count = max((kb.document_count or 0) - 1, 0)

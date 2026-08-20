@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from core.database import get_db
 from models.chat import ChatAttachment
 from service import DocumentService, WebSearchService, ChatService, SessionService, ServiceConfig
-from service.retrieval_service import retrieve_content
+from service.retrieval_service import retrieve_content, retrieve_from_knowledge_bases
 from schemas import ChatRequest, LegacySessionResponse, ChatWithAttachmentsRequest
 
 # Create router instance
@@ -238,33 +238,73 @@ async def chat_completion_with_attachments(
 
     # 获取附件内容
     attachment_contents = []
+    attachment_problems = []
     if request.attachment_ids:
         for att_id in request.attachment_ids:
             try:
                 att_uuid = UUID(att_id)
-                att = db.query(ChatAttachment).filter(ChatAttachment.id == att_uuid).first()
-                if att and att.content_text and att.status == "completed":
-                    attachment_contents.append({
-                        "filename": att.filename,
-                        "content": att.content_text[:10000],  # 限制每个附件内容长度
-                    })
             except ValueError:
+                attachment_problems.append(f"附件ID非法: {att_id}")
                 continue
+
+            att = db.query(ChatAttachment).filter(ChatAttachment.id == att_uuid).first()
+            if not att:
+                attachment_problems.append(f"附件不存在: {att_id}")
+                continue
+            if att.status != "completed":
+                attachment_problems.append(
+                    f"附件 {att.filename} 尚未处理完成（状态: {att.status}"
+                    + (f", 原因: {att.error_message}" if att.error_message else "")
+                    + "）"
+                )
+                continue
+            if not att.content_text:
+                attachment_problems.append(f"附件 {att.filename} 没有可用文本内容")
+                continue
+
+            attachment_contents.append({
+                "filename": att.filename,
+                "content": att.content_text[:10000],  # 限制每个附件内容长度
+            })
+
+    # 知识库列表（用于真实的知识库 RAG 检索）
+    user_knowledge_bases = []
+    if request.search_knowledge:
+        from models.knowledge import KnowledgeBase
+
+        kb_query = db.query(KnowledgeBase)
+        if request.session_id:
+            try:
+                from models.chat import ChatSession as ChatSessionModel
+
+                session_row = db.query(ChatSessionModel).filter(
+                    ChatSessionModel.id == UUID(str(request.session_id))
+                ).first()
+                if session_row and session_row.user_id:
+                    kb_query = kb_query.filter(KnowledgeBase.user_id == session_row.user_id)
+            except (ValueError, AttributeError):
+                pass
+
+        user_knowledge_bases = [
+            {"id": kb.id, "name": kb.name} for kb in kb_query.all()
+        ]
 
     async def generate_response():
         try:
-            # 从政策文档索引检索
+            # 从知识库检索（旧实现固定查询不存在的 policy_documents 集合，导致永远检索不到上传的文档）
             policy_docs = []
-            if request.search_knowledge:
-                retrieved_data = retrieve_content(
-                    indexNames="policy_documents",
-                    question=request.question
+            if request.search_knowledge and user_knowledge_bases:
+                retrieved_data = retrieve_from_knowledge_bases(
+                    knowledge_bases=user_knowledge_bases,
+                    question=request.question,
+                    top_k=5,
                 )
                 for item in retrieved_data:
+                    kb_label = item.get("kb_name") or "知识库"
                     policy_docs.append({
                         "id": item["id"],
                         "content": item["content_with_weight"],
-                        "source": f"{item['document_name']} (ID: {item['document_id']})",
+                        "source": f"{item['document_name']} ({kb_label})",
                         "document_id": item["document_id"],
                         "document_name": item["document_name"]
                     })
@@ -290,6 +330,12 @@ async def chat_completion_with_attachments(
                 for att in attachment_contents:
                     attachment_context += f"\n--- {att['filename']} ---\n{att['content']}\n"
                 attachment_context += "\n=== 附件内容结束 ===\n\n"
+            if attachment_problems:
+                attachment_context += (
+                    "\n[以下附件无法使用，请在回答中说明]: "
+                    + "; ".join(attachment_problems)
+                    + "\n"
+                )
 
             # 修改问题，加入附件上下文
             enhanced_question = request.question

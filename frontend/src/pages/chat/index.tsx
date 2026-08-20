@@ -153,7 +153,7 @@ export default function Index() {
             if (res.data) {
               setAttachments(prev =>
                 prev.map(a =>
-                  a.id === att.id ? { ...a, status: res.data.status } : a
+                  a.id === att.id ? { ...a, status: res.data.process_status } : a
                 )
               )
             }
@@ -196,7 +196,7 @@ export default function Index() {
         setAttachments(prev =>
           prev.map(a =>
             a.id === tempId
-              ? { id: res.data.id, filename: res.data.filename, status: res.data.status }
+              ? { id: res.data.id, filename: res.data.filename, status: res.data.process_status }
               : a
           )
         )

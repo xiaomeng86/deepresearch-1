@@ -147,10 +147,10 @@ export default function NewChat() {
           try {
             const res = await api.session.getAttachment(att.id)
             const data = res.data || res
-            if (data && data.status) {
+            if (data && data.process_status) {
               setAttachments(prev =>
                 prev.map(a =>
-                  a.id === att.id ? { ...a, status: data.status } : a
+                  a.id === att.id ? { ...a, status: data.process_status } : a
                 )
               )
             }
@@ -208,7 +208,7 @@ export default function NewChat() {
       if (attachmentData && attachmentData.id) {
         // 上传成功后，将状态设为 completed（后端处理完成后会变成 completed）
         // 如果后端返回 pending/processing，则启动轮询
-        const newStatus = attachmentData.status === 'completed' ? 'completed' : attachmentData.status
+        const newStatus = attachmentData.process_status === 'completed' ? 'completed' : attachmentData.process_status
         setAttachments(prev =>
           prev.map(a =>
             a.id === tempId
